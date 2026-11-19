@@ -29,6 +29,8 @@ class InspectionRequest(BaseModel):
     """Optional serial supplied by the operator. The API generates one when omitted."""
 
     serial_number: str | None = Field(default=None, max_length=64)
+    sequence_id: str = "seq_a"
+    step_id: int = 1
 
     @field_validator("serial_number")
     @classmethod
@@ -54,3 +56,5 @@ class ServiceInfo(BaseModel):
     service: str
     docs: str
     health: str
+
+

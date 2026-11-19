@@ -1,7 +1,23 @@
 import { useCallback, useEffect, useState } from "react";
 import type { LinkStatus, SocketMessage, TestResult } from "../types";
 
-const SWITCH_LABELS = ["SW1", "SW2", "SW3", "SW4", "SW5"];
+// const SWITCH_LABELS = ["SW1", "SW2", "SW3", "SW4", "SW5"];
+const SWITCH_LABELS = ["SW1", "SW2", "SW3", "SW4"];
+
+// Diccionario de recetas industriales
+const SEQUENCES: Record<string, { id: number; name: string; instruction: string }[]> = {
+  seq_a: [
+    { id: 1, name: "Top Alignment", instruction: "Coloca la PCBA de frente en el fixture y presiona Trigger." },
+    { id: 2, name: "Side Connectors", instruction: "Gira la PCBA 90° a la derecha y presiona Trigger." },
+    { id: 3, name: "Bottom Check", instruction: "Voltea la PCBA boca abajo y presiona Trigger." }
+  ],
+  seq_b: [
+    { id: 1, name: "Final Assembly", instruction: "Coloca la pieza final ensamblada y presiona Trigger." }
+  ],
+  seq_c: [
+    { id: 1, name: "Quick Test", instruction: "Inspección rápida de un solo paso." }
+  ]
+};
 
 function mergeResult(current: TestResult[], incoming: TestResult): TestResult[] {
   const exists = current.some((row) => row.id === incoming.id);
@@ -89,6 +105,14 @@ export function Dashboard() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Estados nuevos de la Máquina de Estados y Recetas
+  const [selectedSequence, setSelectedSequence] = useState("seq_a");
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [changingJob, setChangingJob] = useState(false);
+
+  const currentSequenceSteps = SEQUENCES[selectedSequence] || SEQUENCES.seq_a;
+  const currentStepDef = currentSequenceSteps[currentStepIndex];
+
   const applyStatus = useCallback((nextCamera: LinkStatus, nextDatabase: LinkStatus) => {
     setCamera(nextCamera);
     setDatabase(nextDatabase);
@@ -96,13 +120,10 @@ export function Dashboard() {
 
   useEffect(() => {
     let cancelled = false;
-
     async function loadHistory() {
       try {
         const response = await fetch("/api/results?limit=100");
-        if (!response.ok) {
-          throw new Error(await readError(response));
-        }
+        if (!response.ok) throw new Error(await readError(response));
         const rows = (await response.json()) as TestResult[];
         if (!cancelled) {
           setResults(rows);
@@ -113,45 +134,27 @@ export function Dashboard() {
           setError(err instanceof Error ? err.message : "Could not load inspection history");
         }
       } finally {
-        if (!cancelled) {
-          setLoadingHistory(false);
-        }
+        if (!cancelled) setLoadingHistory(false);
       }
     }
-
     void loadHistory();
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
     let cancelled = false;
-
     async function pollHealth() {
       try {
         const response = await fetch("/api/health");
-        if (!response.ok) {
-          throw new Error(await readError(response));
-        }
-        const body = (await response.json()) as {
-          camera: "connected" | "disconnected";
-          database: "connected" | "disconnected";
-        };
-        if (!cancelled) {
-          applyStatus(body.camera, body.database);
-        }
+        if (!response.ok) throw new Error(await readError(response));
+        const body = (await response.json()) as { camera: "connected" | "disconnected"; database: "connected" | "disconnected"; };
+        if (!cancelled) applyStatus(body.camera, body.database);
       } catch {
-        if (!cancelled) {
-          applyStatus("disconnected", "disconnected");
-        }
+        if (!cancelled) applyStatus("disconnected", "disconnected");
       }
     }
-
     void pollHealth();
-    const timer = window.setInterval(() => {
-      void pollHealth();
-    }, 5000);
+    const timer = window.setInterval(() => { void pollHealth(); }, 5000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -165,11 +168,6 @@ export function Dashboard() {
     let retryTimer = 0;
 
     const connect = () => {
-      // const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      // socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
-
-      // socket.onopen = () => {
-      // Nos saltamos el proxy de Vite y vamos directo al backend
       socket = new WebSocket("ws://127.0.0.1:8000/ws");
 
       socket.onopen = () => {
@@ -181,12 +179,10 @@ export function Dashboard() {
         let payload: unknown;
         try {
           payload = JSON.parse(event.data) as unknown;
-        } catch {
-          return;
-        }
-        if (!isSocketMessage(payload)) {
-          return;
-        }
+        } catch { return; }
+        
+        if (!isSocketMessage(payload)) return;
+        
         if (payload.type === "status") {
           applyStatus(payload.camera, payload.database);
           return;
@@ -218,23 +214,69 @@ export function Dashboard() {
     };
   }, [applyStatus]);
 
+  // Manejador del cambio de receta (Cambia el .jobx en la cámara física)
+  async function handleSequenceChange(e: React.ChangeEvent<HTMLSelectElement>) {
+    const newSeq = e.target.value;
+    setSelectedSequence(newSeq);
+    setCurrentStepIndex(0); 
+    setChangingJob(true);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/camera/job", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sequence_id: newSeq })
+      });
+      if (!res.ok) {
+        const errText = await readError(res);
+        throw new Error(errText || "Falla al cambiar Job en la cámara");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Error de comunicación al cambiar receta.");
+    } finally {
+      setChangingJob(false);
+    }
+  }
+
+  // Máquina de estados: Dispara e inyecta el step
   async function triggerInspection() {
     setBusy(true);
     setError(null);
+    
+    // Anexa el sufijo del paso al número de serie base
+    const baseSerial = serialNumber.trim() ? serialNumber.trim() : "AUTO";
+    const stepSerial = `${baseSerial}-S${currentStepDef.id}`;
+
     try {
       const response = await fetch("/api/inspections", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          serial_number: serialNumber.trim() ? serialNumber.trim() : null,
+          serial_number: stepSerial,
+          sequence_id: selectedSequence, // <--- AGREGA ESTA LÍNEA
+          step_id: currentStepDef.id
         }),
       });
+      
       if (!response.ok) {
         throw new Error(await readError(response));
       }
+      
       const row = (await response.json()) as TestResult;
       setResults((current) => mergeResult(current, row));
-      setSerialNumber("");
+      
+      // Validación estricta de Manufactura (Solo avanza si pasó)
+      if (row.inspection_result) {
+        if (currentStepIndex < currentSequenceSteps.length - 1) {
+          setCurrentStepIndex(prev => prev + 1);
+        } else {
+          setCurrentStepIndex(0); // Reinicia
+          setSerialNumber("");    // Limpia
+        }
+      } else {
+        throw new Error(`Inspección falló (FAIL) en ${currentStepDef.name}. Acomode e intente de nuevo.`);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Inspection failed");
     } finally {
@@ -252,10 +294,42 @@ export function Dashboard() {
             <div>
               <h2 className="text-base font-semibold text-white">Inspection control</h2>
               <p className="mt-1 text-sm text-slate-400">
-                Sends <span className="font-mono text-slate-200">SE8</span> to the camera,
-                waits for the ASCII result, and stores it.
+                Selecciona receta, sigue los pasos y dispara al sensor.
               </p>
             </div>
+          </div>
+
+          {/* Selector de Receta */}
+          <label className="mt-5 block text-xs uppercase tracking-wider text-slate-400">
+            Secuencia de Inspección (Receta)
+          </label>
+          <div className="mt-2">
+            <select
+              value={selectedSequence}
+              onChange={(e) => { void handleSequenceChange(e); }}
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none ring-amber-400/40 focus:ring-2 disabled:opacity-50"
+              disabled={currentStepIndex > 0 || changingJob || busy}
+            >
+              <option value="seq_a">Sequence A - Multi-angle PCBA</option>
+              <option value="seq_b">Sequence B - Final Assembly</option>
+              <option value="seq_c">Sequence C - Quick Test</option>
+            </select>
+            {changingJob && (
+              <p className="mt-2 text-xs text-amber-400 animate-pulse">
+                Cargando .jobx en el sensor...
+              </p>
+            )}
+          </div>
+
+          {/* Pantalla del Operador */}
+          <div className="mt-4 p-4 rounded-lg bg-slate-950 border border-amber-500/30">
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-xs font-bold text-amber-400 uppercase">
+                Paso {currentStepIndex + 1} de {currentSequenceSteps.length}
+              </span>
+              <span className="text-xs font-mono text-slate-400">{currentStepDef.name}</span>
+            </div>
+            <p className="text-sm text-slate-200">{currentStepDef.instruction}</p>
           </div>
 
           <label className="mt-5 block text-xs uppercase tracking-wider text-slate-400" htmlFor="serial">
@@ -269,18 +343,17 @@ export function Dashboard() {
               placeholder="Leave blank to generate one"
               maxLength={64}
               autoComplete="off"
-              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none ring-amber-400/40 placeholder:text-slate-600 focus:ring-2"
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none ring-amber-400/40 placeholder:text-slate-600 focus:ring-2 disabled:opacity-50"
+              disabled={currentStepIndex > 0 || changingJob || busy}
             />
             <button
               type="button"
-              onClick={() => {
-                void triggerInspection();
-              }}
-              disabled={busy || camera !== "connected" || database !== "connected"}
+              onClick={() => { void triggerInspection(); }}
+              disabled={busy || changingJob || camera !== "connected" || database !== "connected"}
               aria-busy={busy}
               className="shrink-0 rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
             >
-              {busy ? "Inspecting…" : "Trigger Inspection"}
+              {busy ? "Inspecting…" : `Trigger Step ${currentStepIndex + 1}`}
             </button>
           </div>
           <p className="mt-3 text-xs text-slate-500">

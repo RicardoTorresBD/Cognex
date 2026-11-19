@@ -20,10 +20,21 @@ import logging
 import secrets
 from datetime import datetime, timezone
 
+
+
+from datetime import datetime, timezone
+from pydantic import BaseModel
+
 from fastapi import Body, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+
+class InspectionRequest(BaseModel):
+    serial_number: str
+    sequence_id: str = "seq_a"
+    step_id: int = 1
 
 from cognex_service import (
     CognexCameraClient,
@@ -36,6 +47,22 @@ from config import settings
 from database import dispose_engine, ensure_schema, get_db, ping_database
 from models import TestResult
 from schemas import HealthStatus, InspectionRequest, ServiceInfo, TestResultRead
+
+
+# Specs por secuencia y por paso (step_id)
+EXPECTED_SWITCHES: dict[str, dict[int, list[int]]] = {
+    "seq_a": {
+        1: [0, 0, 0, 0],  # Paso 1: Top Alignment
+        2: [1, 1, 0, 1],  # Paso 2: Side Connectors (cambia por tu spec real)
+        3: [1, 0, 1, 0],  # Paso 3: Bottom Check
+    },
+    "seq_b": {
+        1: [1, 0, 1, 1],
+    },
+    "seq_c": {
+        1: [1, 1, 0, 0],
+    },
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -250,54 +277,62 @@ async def list_results(
         raise HTTPException(status_code=503, detail="Database query failed") from exc
 
 
-@app.post("/api/inspections", response_model=TestResultRead, status_code=201)
+@app.post("/api/inspections", response_model=TestResultRead)
 async def trigger_inspection(
-    body: InspectionRequest | None = Body(default=None),
+    request: InspectionRequest,
     session: AsyncSession = Depends(get_db),
 ) -> TestResult:
-    """Fire the camera, persist the reading, and broadcast it to dashboards."""
-    if not runtime.camera_ready:
-        raise HTTPException(status_code=503, detail="Camera is disconnected")
+    """Inyecta el paso en A3, dispara SE8, lee B38 y guarda en Postgres."""
     if not runtime.db_ready:
         raise HTTPException(status_code=503, detail="Database is disconnected")
 
-    serial_number = body.serial_number if body and body.serial_number else _new_serial()
-
     try:
-        reading = await runtime.cognex.trigger(settings.cognex_trigger_command)
-    except CognexConnectionError as exc:
-        runtime.camera_ready = False
-        await manager.broadcast(status_message())
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except CognexProtocolError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except CognexError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        reading = await runtime.cognex.trigger(step_id=request.step_id)
 
-    record = TestResult(
-        serial_number=serial_number,
-        dip_switch_status={"positions": reading.dip_positions, "raw": reading.raw},
-        inspection_result=reading.passed,
-    )
-    session.add(record)
-    try:
+        positions: list[str] = []
+        passed = False
+
+        if reading.exec_status == "OK":
+            read_bits = [int(b) for b in reading.payload]
+            positions = ["ON" if b == 1 else "OFF" for b in read_bits]
+
+            seq_specs = EXPECTED_SWITCHES.get(request.sequence_id, {})
+            expected = seq_specs.get(reading.step_ack)
+            if expected is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Sin spec para {request.sequence_id} paso {reading.step_ack}",
+                )
+            passed = (read_bits == expected)
+
+        dip_switch_status = {
+            "positions": positions,      # ej. ["OFF", "OFF", "OFF", "OFF"]
+            "raw": reading.raw_data,     # ej. "OK,1,2,0,0,0,0"
+        }
+
+        # Guardado directo con SQLAlchemy AsyncSession
+        row = TestResult(
+            serial_number=request.serial_number or "AUTO",
+            dip_switch_status=dip_switch_status,
+            inspection_result=passed,
+        )
+        session.add(row)
         await session.commit()
-        await session.refresh(record)
-    except Exception as exc:
-        logger.exception("Failed to store inspection for %s", serial_number)
-        runtime.db_ready = False
-        await manager.broadcast(status_message())
-        raise HTTPException(status_code=503, detail="Could not store the inspection") from exc
+        await session.refresh(row)  # Trae el id y timestamp generados por Postgres
 
-    payload = TestResultRead.model_validate(record).model_dump(mode="json")
-    await manager.broadcast({"type": "inspection", "result": payload})
-    logger.info(
-        "Inspection %s serial=%s result=%s",
-        record.id,
-        record.serial_number,
-        "PASS" if record.inspection_result else "FAIL",
-    )
-    return record
+        # Si tienes broadcast de WebSocket en tu runtime, lo mandas aquí:
+        # await runtime.broadcast({
+        #     "type": "inspection",
+        #     "result": TestResultRead.model_validate(row).model_dump(mode="json"),
+        # })
+
+        return row
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Falla en trigger_inspection")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.websocket("/ws")

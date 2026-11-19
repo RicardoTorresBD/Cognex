@@ -1,6 +1,6 @@
 """Mock Cognex In-Sight camera speaking Native Mode ASCII over TCP.
 
-A real In-Sight job is usually fired with ``SE8`` (Set Event, soft trigger).
+A real In-Sight job is usually fired with ``SW8`` (Set Event, soft trigger).
 Some cells send the literal word ``Trigger``. This simulator accepts both,
 waits 500 ms to imitate acquire time, then returns one comma-separated line:
 
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-_TRIGGER_COMMANDS = {"SE8", "TRIGGER"}
+_TRIGGER_COMMANDS = {"SW8", "TRIGGER"}
 _SWITCH_STATES = ("ON", "OFF")
 _ACQUIRE_DELAY_SECONDS = 0.5
 _MAX_COMMAND_BYTES = 256
@@ -40,13 +40,19 @@ class CognexProtocolError(CognexError):
     """The peer replied with a payload this service cannot use."""
 
 
-@dataclass(frozen=True)
 class CognexReading:
-    """Parsed inspection from one trigger cycle."""
+    def __init__(self, raw_data: str):
+        self.raw_data = raw_data.strip()
+        parts = [p.strip() for p in self.raw_data.split(",")]
+        
+        if len(parts) < 4:
+            raise CognexProtocolError(f"Payload incompleto desde B38: '{self.raw_data}'")
 
-    passed: bool
-    dip_positions: list[str]
-    raw: str
+        self.exec_status = parts[0]          # "OK" o "ERR"
+        self.step_ack = int(parts[1])        # 1, 2, etc.
+        self.exec_time_ms = int(parts[2])    # ej. 2
+        self.payload = parts[3:]             # ej. ["0", "0", "0", "0"] o ["NO_SWITCH"]
+        self.status = self.exec_status       # Compatibilidad con tu código actual
 
 
 def parse_reading(payload: str) -> CognexReading:
@@ -176,18 +182,27 @@ class CognexCameraClient:
         self.port = port
         self.timeout = timeout
 
-    async def trigger(self, command: str = "SE8") -> CognexReading:
-        """Send a trigger and return the parsed inspection line."""
-        line = await self._transact(command)
-        stripped = line.strip()
-        if stripped.startswith("0,"):
-            raise CognexProtocolError(f"Camera returned an error: {stripped}")
+    async def trigger(self, command: str = "SW8", step_id: int = 1) -> CognexReading:
+        """Inyecta el paso actual (SI) a la celda A3, dispara SW8 y lee B38."""
         try:
-            return parse_reading(stripped)
-        except CognexProtocolError:
-            raise
+            # 1. Avisarle a la cámara en qué paso vamos (Celda A3)
+            resp_si = await self._transact(f"SIA003 {step_id}", lines_to_read=1)
+            if resp_si != "1":
+                logger.warning(f"Set Integer A003 devolvió: {resp_si}")
+            
+            # 2. Tira el gatillo (SW8)
+            await self._transact(command, lines_to_read=1)
+            
+            # 3. Leer la celda B38 (línea 1 = "1", línea 2 = "OK,1,2,0,0,0,0")
+            raw_resp = await self._transact("GVB038", lines_to_read=2)
+            lines = [line.strip() for line in raw_resp.splitlines() if line.strip()]
+            
+            if len(lines) < 2 or lines[0] != "1":
+                raise CognexProtocolError(f"Error leyendo B38. Respuesta: {raw_resp}")
+                
+            return CognexReading(lines[1])
         except Exception as exc:
-            raise CognexProtocolError(f"Could not parse camera response {stripped!r}") from exc
+            raise CognexProtocolError(f"Falla en la secuencia de Trigger: {exc}")
 
     # async def probe(self) -> bool:
     #     """Return true when the camera accepts a TCP session and answers PING."""
@@ -205,7 +220,7 @@ class CognexCameraClient:
         except Exception:
             return False
         
-    async def _transact(self, command: str) -> str:
+    async def _transact(self, command: str, lines_to_read: int = 1) -> str:
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port),
@@ -226,14 +241,18 @@ class CognexCameraClient:
             
             await asyncio.wait_for(reader.readline(), timeout=self.timeout)
 
-            # 2. Enviar el comando exacto que pide el dashboard (ej. SE8)
+            # 2. Enviar el comando exacto que pide el dashboard (ej. SW8)
             writer.write(f"{command}\r\n".encode("ascii"))
             await writer.drain()
             
-            data = await asyncio.wait_for(reader.readline(), timeout=self.timeout)
-            if not data:
-                raise CognexProtocolError("Camera closed the connection without a response")
-            return data.decode("ascii", errors="replace")
+            lines: list[str] = []
+            for _ in range(lines_to_read):
+                data = await asyncio.wait_for(reader.readline(), timeout=self.timeout)
+                if not data:
+                    raise CognexProtocolError("Camera closed the connection without a response")
+                lines.append(data.decode("ascii", errors="replace").strip())
+
+            return "\n".join(lines)
             
         finally:
             writer.close()

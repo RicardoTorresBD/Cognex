@@ -115,3 +115,26 @@ docker compose down
 ```
 
 `docker compose down -v` also deletes the Postgres volume and the stored inspections.
+
+
+
+## Testing
+if you want to test ONLY the cammerda communication you can use the following script 
+import socket, time
+
+HOST, PORT = "169.254.4.28", 23  # Ajusta si usas otro puerto
+
+def run_cmds(cmds):
+    with socket.create_connection((HOST, PORT), timeout=5) as s:
+        f = s.makefile("rwb", buffering=0)
+        f.read(100)  # banner / User:
+        f.write(b"admin\r\n"); time.sleep(0.2); f.read(100)
+        f.write(b"\r\n"); time.sleep(0.2); f.read(100)
+        for cmd in cmds:
+            f.write(f"{cmd}\r\n".encode())
+            time.sleep(0.3)
+            resp = f.readline().decode(errors="replace").strip()
+            print(f"{cmd} -> {resp}")
+
+print("--- PRUEBA 1: Solo Offline y Online (sin LF) ---")
+run_cmds(["GO", "SO0", "GO", "SO1", "GO"])

@@ -1,22 +1,25 @@
 import { useCallback, useEffect, useState } from "react";
 import type { LinkStatus, SocketMessage, TestResult } from "../types";
 
-// const SWITCH_LABELS = ["SW1", "SW2", "SW3", "SW4", "SW5"];
 const SWITCH_LABELS = ["SW1", "SW2", "SW3", "SW4"];
 
-// Diccionario de recetas industriales
+// Diccionario de recetas industriales (Orden: 1. Product Info -> 2. DIP Switches)
 const SEQUENCES: Record<string, { id: number; name: string; instruction: string }[]> = {
+  seq_b: [
+    {
+      id: 1,
+      name: "Read Product Info",
+      instruction: "Coloca la PCBA bajo el sensor para leer Serial Number, Part Number y Revisión.",
+    },
+  ],
   seq_a: [
     { id: 1, name: "Top Alignment", instruction: "Coloca la PCBA de frente en el fixture y presiona Trigger." },
     { id: 2, name: "Side Connectors", instruction: "Gira la PCBA 90° a la derecha y presiona Trigger." },
-    { id: 3, name: "Bottom Check", instruction: "Voltea la PCBA boca abajo y presiona Trigger." }
-  ],
-  seq_b: [
-    { id: 1, name: "Final Assembly", instruction: "Coloca la pieza final ensamblada y presiona Trigger." }
+    { id: 3, name: "Bottom Check", instruction: "Voltea la PCBA boca abajo y presiona Trigger." },
   ],
   seq_c: [
-    { id: 1, name: "Quick Test", instruction: "Inspección rápida de un solo paso." }
-  ]
+    { id: 1, name: "Quick Test", instruction: "Inspección rápida de un solo paso." },
+  ],
 };
 
 function mergeResult(current: TestResult[], incoming: TestResult): TestResult[] {
@@ -98,6 +101,8 @@ function formatTime(value: string): string {
 export function Dashboard() {
   const [results, setResults] = useState<TestResult[]>([]);
   const [serialNumber, setSerialNumber] = useState("");
+  const [partNumber, setPartNumber] = useState("");
+  const [revision, setRevision] = useState("");
   const [camera, setCamera] = useState<LinkStatus>("connecting");
   const [database, setDatabase] = useState<LinkStatus>("connecting");
   const [liveLink, setLiveLink] = useState<LinkStatus>("connecting");
@@ -105,12 +110,12 @@ export function Dashboard() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Estados nuevos de la Máquina de Estados y Recetas
-  const [selectedSequence, setSelectedSequence] = useState("seq_a");
+  // Arranca por defecto en seq_b (Product Info)
+  const [selectedSequence, setSelectedSequence] = useState("seq_b");
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [changingJob, setChangingJob] = useState(false);
 
-  const currentSequenceSteps = SEQUENCES[selectedSequence] || SEQUENCES.seq_a;
+  const currentSequenceSteps = SEQUENCES[selectedSequence] || SEQUENCES.seq_b;
   const currentStepDef = currentSequenceSteps[currentStepIndex];
 
   const applyStatus = useCallback((nextCamera: LinkStatus, nextDatabase: LinkStatus) => {
@@ -147,7 +152,10 @@ export function Dashboard() {
       try {
         const response = await fetch("/api/health");
         if (!response.ok) throw new Error(await readError(response));
-        const body = (await response.json()) as { camera: "connected" | "disconnected"; database: "connected" | "disconnected"; };
+        const body = (await response.json()) as {
+          camera: "connected" | "disconnected";
+          database: "connected" | "disconnected";
+        };
         if (!cancelled) applyStatus(body.camera, body.database);
       } catch {
         if (!cancelled) applyStatus("disconnected", "disconnected");
@@ -180,9 +188,9 @@ export function Dashboard() {
         try {
           payload = JSON.parse(event.data) as unknown;
         } catch { return; }
-        
+
         if (!isSocketMessage(payload)) return;
-        
+
         if (payload.type === "status") {
           applyStatus(payload.camera, payload.database);
           return;
@@ -214,11 +222,10 @@ export function Dashboard() {
     };
   }, [applyStatus]);
 
-  // Manejador del cambio de receta (Cambia el .jobx en la cámara física)
-  async function handleSequenceChange(e: React.ChangeEvent<HTMLSelectElement>) {
-    const newSeq = e.target.value;
-    setSelectedSequence(newSeq);
-    setCurrentStepIndex(0); 
+  // Helper para cambiar el .jobx en la cámara física
+  async function loadCameraJob(seqId: string) {
+    setSelectedSequence(seqId);
+    setCurrentStepIndex(0);
     setChangingJob(true);
     setError(null);
 
@@ -226,7 +233,7 @@ export function Dashboard() {
       const res = await fetch("/api/camera/job", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sequence_id: newSeq })
+        body: JSON.stringify({ sequence_id: seqId }),
       });
       if (!res.ok) {
         const errText = await readError(res);
@@ -239,14 +246,33 @@ export function Dashboard() {
     }
   }
 
-  // Máquina de estados: Dispara e inyecta el step
+  async function handleSequenceChange(e: React.ChangeEvent<HTMLSelectElement>) {
+    await loadCameraJob(e.target.value);
+  }
+
+  // Botón de Clear / Reset a modo seguro (regresa a seq_b y limpia todo)
+  async function handleClearReset() {
+    setSerialNumber("");
+    setPartNumber("");
+    setRevision("");
+    setCurrentStepIndex(0);
+    setError(null);
+
+    if (selectedSequence !== "seq_b") {
+      await loadCameraJob("seq_b");
+    }
+  }
+
+  // Máquina de estados: Dispara Product Info (seq_b) o DIP Switches (seq_a)
   async function triggerInspection() {
     setBusy(true);
     setError(null);
-    
-    // Anexa el sufijo del paso al número de serie base
+
     const baseSerial = serialNumber.trim() ? serialNumber.trim() : "AUTO";
-    const stepSerial = `${baseSerial}-S${currentStepDef.id}`;
+    const stepSerial =
+      selectedSequence === "seq_b"
+        ? baseSerial
+        : `${baseSerial}-S${currentStepDef.id}`;
 
     try {
       const response = await fetch("/api/inspections", {
@@ -254,25 +280,49 @@ export function Dashboard() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           serial_number: stepSerial,
-          sequence_id: selectedSequence, // <--- AGREGA ESTA LÍNEA
-          step_id: currentStepDef.id
+          sequence_id: selectedSequence,
+          step_id: currentStepDef.id,
         }),
       });
-      
+
       if (!response.ok) {
         throw new Error(await readError(response));
       }
-      
+
       const row = (await response.json()) as TestResult;
       setResults((current) => mergeResult(current, row));
-      
-      // Validación estricta de Manufactura (Solo avanza si pasó)
+
+      // Si corrimos Product Info (seq_b), llenamos SN, PN y Revision desde el raw
+      if (selectedSequence === "seq_b") {
+        const raw = row.dip_switch_status?.raw ?? "";
+        const parts = raw.split(",").map((p) => p.trim());
+        // Formato esperado: OK,1,<ms>,<SN>,<PN>,<REV>
+        if (parts[0] === "OK" && parts.length >= 6) {
+          const detectedSn = parts[3];
+          const detectedPn = parts[4];
+          const detectedRev = parts[5];
+
+          if (detectedSn && detectedSn !== "NO_SN") setSerialNumber(detectedSn);
+          if (detectedPn && detectedPn !== "NO_PN") setPartNumber(detectedPn);
+          if (detectedRev && detectedRev !== "NO_REV") setRevision(detectedRev);
+        }
+
+        if (!row.inspection_result) {
+          throw new Error("No se pudo leer Product Info completo. Verifica la etiqueta e intenta de nuevo.");
+        }
+        return;
+      }
+
+      // Validación estricta de Manufactura para switches (seq_a / seq_c)
       if (row.inspection_result) {
         if (currentStepIndex < currentSequenceSteps.length - 1) {
-          setCurrentStepIndex(prev => prev + 1);
+          setCurrentStepIndex((prev) => prev + 1);
         } else {
-          setCurrentStepIndex(0); // Reinicia
-          setSerialNumber("");    // Limpia
+          // Terminó toda la secuencia: limpia campos y regresa a modo seguro
+          setCurrentStepIndex(0);
+          setSerialNumber("");
+          setPartNumber("");
+          setRevision("");
         }
       } else {
         throw new Error(`Inspección falló (FAIL) en ${currentStepDef.name}. Acomode e intente de nuevo.`);
@@ -294,9 +344,17 @@ export function Dashboard() {
             <div>
               <h2 className="text-base font-semibold text-white">Inspection control</h2>
               <p className="mt-1 text-sm text-slate-400">
-                Selecciona receta, sigue los pasos y dispara al sensor.
+                1. Escanea Product Info (SEQB) · 2. Corre DIP Switches (SEQA).
               </p>
             </div>
+            <button
+              type="button"
+              onClick={() => { void handleClearReset(); }}
+              disabled={busy || changingJob}
+              className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-xs font-semibold uppercase tracking-wider text-rose-300 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Clear / Reset
+            </button>
           </div>
 
           {/* Selector de Receta */}
@@ -310,9 +368,9 @@ export function Dashboard() {
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none ring-amber-400/40 focus:ring-2 disabled:opacity-50"
               disabled={currentStepIndex > 0 || changingJob || busy}
             >
-              <option value="seq_a">Sequence A - Multi-angle PCBA</option>
-              <option value="seq_b">Sequence B - Final Assembly</option>
-              <option value="seq_c">Sequence C - Quick Test</option>
+              <option value="seq_b">1. Product Info - Scan SN / PN / Rev (SEQB)</option>
+              <option value="seq_a">2. DIP Switches - Multi-angle PCBA (SEQA)</option>
+              <option value="seq_c">3. Quick Test (SEQC)</option>
             </select>
             {changingJob && (
               <p className="mt-2 text-xs text-amber-400 animate-pulse">
@@ -322,25 +380,53 @@ export function Dashboard() {
           </div>
 
           {/* Pantalla del Operador */}
-          <div className="mt-4 p-4 rounded-lg bg-slate-950 border border-amber-500/30">
-            <div className="flex justify-between items-center mb-2">
-              <span className="text-xs font-bold text-amber-400 uppercase">
+          <div className="mt-4 rounded-lg border border-amber-500/30 bg-slate-950 p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-bold uppercase text-amber-400">
                 Paso {currentStepIndex + 1} de {currentSequenceSteps.length}
               </span>
-              <span className="text-xs font-mono text-slate-400">{currentStepDef.name}</span>
+              <span className="font-mono text-xs text-slate-400">{currentStepDef.name}</span>
             </div>
             <p className="text-sm text-slate-200">{currentStepDef.instruction}</p>
           </div>
 
-          <label className="mt-5 block text-xs uppercase tracking-wider text-slate-400" htmlFor="serial">
+          {/* Campos de Board Info (llenados por SEQB) */}
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="block text-xs uppercase tracking-wider text-slate-400" htmlFor="partNumber">
+                Part Number
+              </label>
+              <input
+                id="partNumber"
+                value={partNumber}
+                readOnly
+                placeholder="Esperando SEQB…"
+                className="mt-1.5 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 font-mono text-sm text-emerald-300 placeholder:text-slate-600"
+              />
+            </div>
+            <div>
+              <label className="block text-xs uppercase tracking-wider text-slate-400" htmlFor="revision">
+                Revision
+              </label>
+              <input
+                id="revision"
+                value={revision}
+                readOnly
+                placeholder="Esperando SEQB…"
+                className="mt-1.5 w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 font-mono text-sm text-emerald-300 placeholder:text-slate-600"
+              />
+            </div>
+          </div>
+
+          <label className="mt-4 block text-xs uppercase tracking-wider text-slate-400" htmlFor="serial">
             Serial number
           </label>
-          <div className="mt-2 flex flex-col gap-3 sm:flex-row">
+          <div className="mt-1.5 flex flex-col gap-3 sm:flex-row">
             <input
               id="serial"
               value={serialNumber}
               onChange={(event) => setSerialNumber(event.target.value)}
-              placeholder="Leave blank to generate one"
+              placeholder="Escanea SEQB o escribe manual"
               maxLength={64}
               autoComplete="off"
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-sm text-slate-100 outline-none ring-amber-400/40 placeholder:text-slate-600 focus:ring-2 disabled:opacity-50"
@@ -353,7 +439,11 @@ export function Dashboard() {
               aria-busy={busy}
               className="shrink-0 rounded-lg bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
             >
-              {busy ? "Inspecting…" : `Trigger Step ${currentStepIndex + 1}`}
+              {busy
+                ? "Inspecting…"
+                : selectedSequence === "seq_b"
+                  ? "Scan Board Info"
+                  : `Trigger Step ${currentStepIndex + 1}`}
             </button>
           </div>
           <p className="mt-3 text-xs text-slate-500">

@@ -70,6 +70,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("avi")
 
+class JobRequest(BaseModel):
+    sequence_id: str
+
+JOB_MAP = {
+    "seq_a": "SEQA.jobx",
+    "seq_b": "SEQB.jobx",
+    "seq_c": "SEQC.jobx",
+}
 
 class RuntimeState:
     """Links the lifespan task, the camera client, and the route handlers."""
@@ -238,6 +246,20 @@ app.add_middleware(
 )
 
 
+@app.post("/api/camera/job")
+async def change_camera_job(request: JobRequest):
+    """Cambia el archivo .jobx activo en la cámara Cognex."""
+    job_filename = JOB_MAP.get(request.sequence_id)
+    if not job_filename:
+        raise HTTPException(status_code=400, detail="Secuencia no válida")
+
+    try:
+        await runtime.cognex.load_job(job_filename)
+        return {"status": "ok", "job": job_filename}
+    except Exception as exc:
+        logger.exception("Falla al cambiar Job en la cámara")
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
 @app.get("/", response_model=ServiceInfo)
 async def root() -> ServiceInfo:
     return ServiceInfo(
@@ -287,44 +309,50 @@ async def trigger_inspection(
         raise HTTPException(status_code=503, detail="Database is disconnected")
 
     try:
+        
         reading = await runtime.cognex.trigger(step_id=request.step_id)
 
         positions: list[str] = []
         passed = False
+        serial_to_save = request.serial_number or "AUTO"
 
-        if reading.exec_status == "OK":
-            read_bits = [int(b) for b in reading.payload]
-            positions = ["ON" if b == 1 else "OFF" for b in read_bits]
+        # 2. Product Info (SEQB) -> payload: [SN, PN, REV]
+        if request.sequence_id == "seq_b":
+            if reading.exec_status == "OK" and len(reading.payload) >= 3:
+                sn, pn, rev = reading.payload[0], reading.payload[1], reading.payload[2]
+                if sn and sn != "NO_SN":
+                    serial_to_save = sn
+                passed = (sn != "NO_SN" and pn != "NO_PN" and rev != "NO_REV")
 
-            seq_specs = EXPECTED_SWITCHES.get(request.sequence_id, {})
-            expected = seq_specs.get(reading.step_ack)
-            if expected is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Sin spec para {request.sequence_id} paso {reading.step_ack}",
-                )
-            passed = (read_bits == expected)
+        # 3.  DIP Switches (SEQA / SEQC) -> payload: ["0", "0", "0", "0"]
+        else:
+            if reading.exec_status == "OK":
+                read_bits = [int(b) for b in reading.payload]
+                positions = ["ON" if b == 1 else "OFF" for b in read_bits]
+
+                seq_specs = EXPECTED_SWITCHES.get(request.sequence_id, {})
+                expected = seq_specs.get(reading.step_ack)
+                if expected is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Sin spec para {request.sequence_id} paso {reading.step_ack}",
+                    )
+                passed = (read_bits == expected)
 
         dip_switch_status = {
-            "positions": positions,      # ej. ["OFF", "OFF", "OFF", "OFF"]
-            "raw": reading.raw_data,     # ej. "OK,1,2,0,0,0,0"
+            "positions": positions,
+            "raw": reading.raw_data,
         }
 
-        # Guardado directo con SQLAlchemy AsyncSession
+        # 4. Guardar en Postgres
         row = TestResult(
-            serial_number=request.serial_number or "AUTO",
+            serial_number=serial_to_save,
             dip_switch_status=dip_switch_status,
             inspection_result=passed,
         )
         session.add(row)
         await session.commit()
-        await session.refresh(row)  # Trae el id y timestamp generados por Postgres
-
-        # Si tienes broadcast de WebSocket en tu runtime, lo mandas aquí:
-        # await runtime.broadcast({
-        #     "type": "inspection",
-        #     "result": TestResultRead.model_validate(row).model_dump(mode="json"),
-        # })
+        await session.refresh(row)
 
         return row
 

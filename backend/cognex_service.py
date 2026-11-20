@@ -181,10 +181,13 @@ class CognexCameraClient:
         self.host = host
         self.port = port
         self.timeout = timeout
+        self._lock = asyncio.Lock()
 
     async def trigger(self, command: str = "SW8", step_id: int = 1) -> CognexReading:
         """Inyecta el paso actual (SI) a la celda A3, dispara SW8 y lee B38."""
         try:
+
+
             # 1. Avisarle a la cámara en qué paso vamos (Celda A3)
             resp_si = await self._transact(f"SIA003 {step_id}", lines_to_read=1)
             if resp_si != "1":
@@ -212,13 +215,79 @@ class CognexCameraClient:
     #         return False
     #     return reply == "1"
     async def probe(self) -> bool:
-        """Verifica si la camara acepta el login TCP."""
+        if self._lock.locked():
+            return True
         try:
-            # Mandamos un SO1 de sondeo. Si regresa 1 (Exito) o -5 (Ya estaba Online), la comunicacion funciona.
-            reply = (await self._transact("SO1")).strip()
-            return reply in ["1", "-5"]
+            await self._transact("GV000", lines_to_read=1)
+            return True
         except Exception:
             return False
+
+
+    async def load_job(self, job_name: str) -> None:
+        """Cambia el .jobx en una sola sesión TCP bloqueando el health-check."""
+        async with self._lock:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port),
+                    timeout=self.timeout,
+                )
+            except (OSError, asyncio.TimeoutError) as exc:
+                raise CognexConnectionError(f"Camera at {self.host}:{self.port} is unreachable") from exc
+
+            async def send(cmd: str, read_timeout: float = 10.0) -> str:
+                writer.write(f"{cmd}\r\n".encode("ascii"))
+                await writer.drain()
+                data = await asyncio.wait_for(reader.readline(), timeout=read_timeout)
+                return data.decode("ascii", errors="replace").strip()
+
+            try:
+                # 1. Un solo Login para toda la secuencia
+                await asyncio.wait_for(reader.readuntil(b":"), timeout=self.timeout)
+                writer.write(b"admin\r\n")
+                await writer.drain()
+                await asyncio.wait_for(reader.readuntil(b":"), timeout=self.timeout)
+                writer.write(b"\r\n")
+                await writer.drain()
+                await asyncio.wait_for(reader.readline(), timeout=self.timeout)
+
+                # 2. Offline
+                resp_off = await send("SO0")
+                if resp_off != "1":
+                    raise CognexProtocolError(f"Fallo al poner Offline. Respuesta: {resp_off}")
+
+                # 3. Cargar Job (dándole 15s por si el .jobx está pesado)
+                resp_load = await send(f"LF{job_name}", read_timeout=15.0)
+                logger.info(f"LF{job_name} -> {resp_load}")
+                if resp_load == "-1":
+                    raise CognexProtocolError(f"El archivo {job_name} NO EXISTE en la cámara.")
+                elif resp_load == "-2":
+                    raise CognexProtocolError(f"Sin memoria suficiente para cargar {job_name}.")
+                elif resp_load != "1":
+                    raise CognexProtocolError(f"Error al cargar {job_name}. Respuesta: {resp_load}")
+
+                await asyncio.sleep(2.0)
+
+                # 4. Levantar a Online (o confirmar con GO que ya está Online)
+                for attempt in range(10):
+                    resp_online = await send("SO1")
+                    if resp_online == "1":
+                        logger.info(f"Job {job_name} cargado y cámara Online.")
+                        return
+                    # Verificar si el Job ya levantó solo en Online
+                    if await send("GO") == "1":
+                        logger.info(f"Job {job_name} ya se encuentra Online (GO=1).")
+                        return
+                    logger.warning(f"SO1 devolvió {resp_online}. Reintento {attempt + 1} de 10...")
+                    await asyncio.sleep(1.5)
+
+                raise CognexProtocolError("Se agotaron los reintentos para poner la cámara Online.")
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except (ConnectionError, OSError):
+                    pass
         
     async def _transact(self, command: str, lines_to_read: int = 1) -> str:
         try:
